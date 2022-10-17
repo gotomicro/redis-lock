@@ -12,57 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package rlock
+//go:build demo
+
+package demo
 
 import (
 	"context"
 	_ "embed"
 	"errors"
-	"fmt"
 	"github.com/go-redis/redis/v9"
 	"github.com/google/uuid"
+	"github.com/gotomicro/redis-lock"
 	"golang.org/x/sync/singleflight"
 	"time"
 )
 
 var (
-	//go:embed script/lua/unlock.lua
+	ErrLockNotHold         = errors.New("未持有锁")
+	ErrFailedToPreemptLock = errors.New("加锁失败")
+	//go:embed unlock.lua
 	luaUnlock string
-	//go:embed script/lua/refresh.lua
+	//go:embed refresh.lua
 	luaRefresh string
-
-	//go:embed script/lua/lock.lua
+	//go:embed lock.lua
 	luaLock string
-
-	ErrFailedToPreemptLock = errors.New("rlock: 抢锁失败")
-	// ErrLockNotHold 一般是出现在你预期你本来持有锁，结果却没有持有锁的地方
-	// 比如说当你尝试释放锁的时候，可能得到这个错误
-	// 这一般意味着有人绕开了 rlock 的控制，直接操作了 Redis
-	ErrLockNotHold = errors.New("rlock: 未持有锁")
 )
 
 type Client struct {
 	client redis.Cmdable
-	g      singleflight.Group
+	s      singleflight.Group
 }
 
-func NewClient(client redis.Cmdable) *Client {
+func NewClient(c redis.Cmdable) *Client {
 	return &Client{
-		client: client,
+		client: c,
 	}
 }
 
-func (c *Client) SingleflightLock(ctx context.Context, key string, expiration time.Duration, retry RetryStrategy, timeout time.Duration) (*Lock, error) {
+func (c *Client) SingleflightLock(ctx context.Context, key string,
+	expiration time.Duration, retry rlock.RetryStrategy, timeout time.Duration) (*Lock, error) {
 	for {
 		flag := false
-		result := c.g.DoChan(key, func() (interface{}, error) {
+		resCh := c.s.DoChan(key, func() (interface{}, error) {
 			flag = true
 			return c.Lock(ctx, key, expiration, retry, timeout)
 		})
 		select {
-		case res := <-result:
+		case res := <-resCh:
 			if flag {
-				c.g.Forget(key)
 				if res.Err != nil {
 					return nil, res.Err
 				}
@@ -74,8 +71,9 @@ func (c *Client) SingleflightLock(ctx context.Context, key string, expiration ti
 	}
 }
 
-func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration, retry RetryStrategy, timeout time.Duration) (*Lock, error) {
-	val := uuid.New().String()
+func (c *Client) Lock(ctx context.Context, key string,
+	expiration time.Duration, retry rlock.RetryStrategy, timeout time.Duration) (*Lock, error) {
+	value := uuid.New().String()
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -84,44 +82,44 @@ func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration,
 	}()
 	for {
 		lctx, cancel := context.WithTimeout(ctx, timeout)
-		ok, err := c.client.Eval(lctx, luaLock, []string{key}, val, expiration).Bool()
+		res, err := c.client.Eval(lctx, luaLock, []string{key}, value, expiration).Bool()
 		cancel()
+
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
-			// 非超时错误，那么基本上代表遇到了一些不可挽回的场景，所以没太大必要继续尝试了
-			// 比如说 Redis server 崩了，或者 EOF 了
 			return nil, err
 		}
-		if ok {
-			return newLock(c.client, key, val, expiration), nil
+		if res {
+			return newLock(c.client, key, value, expiration), nil
 		}
 		interval, ok := retry.Next()
 		if !ok {
-			return nil, fmt.Errorf("rlock: 重试机会耗尽，%w", ErrFailedToPreemptLock)
+			// 不用重试
+			return nil, ErrFailedToPreemptLock
 		}
 		if timer == nil {
 			timer = time.NewTimer(interval)
 		}
+		timer.Reset(interval)
 		select {
-		case <-timer.C:
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-timer.C:
 		}
 	}
 }
 
-func (c *Client) TryLock(ctx context.Context,
-	key string, expiration time.Duration) (*Lock, error) {
-	val := uuid.New().String()
-	ok, err := c.client.SetNX(ctx, key, val, expiration).Result()
+// TryLock (ctx, key, time.Second * 10)
+func (c *Client) TryLock(ctx context.Context, key string,
+	expiration time.Duration) (*Lock, error) {
+	value := uuid.New().String()
+	res, err := c.client.SetNX(ctx, key, value, expiration).Result()
 	if err != nil {
-		// 网络问题，服务器问题，或者超时，都会走过来这里
 		return nil, err
 	}
-	if !ok {
-		// 已经有人加锁了，或者刚好和人一起加锁，但是自己竞争失败了
+	if !res {
 		return nil, ErrFailedToPreemptLock
 	}
-	return newLock(c.client, key, val, expiration), nil
+	return newLock(c.client, key, value, expiration), nil
 }
 
 type Lock struct {
@@ -143,31 +141,30 @@ func newLock(client redis.Cmdable, key string, value string, expiration time.Dur
 }
 
 func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error {
-	ticker := time.NewTicker(interval)
-	// 刷新超时 channel
 	ch := make(chan struct{}, 1)
 	defer close(ch)
+	ticker := time.NewTicker(interval)
 	for {
 		select {
-		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			err := l.Refresh(ctx)
-			// 超时这里，可以继续尝试
-			for err == context.DeadlineExceeded {
-				ch <- struct{}{}
-			}
-			cancel()
-			if err != nil {
-				return err
-			}
 		case <-ch:
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			err := l.Refresh(ctx)
-			// 超时这里，可以继续尝试
+			cancel()
 			if err == context.DeadlineExceeded {
 				ch <- struct{}{}
+				continue
 			}
+			if err != nil {
+				return err
+			}
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			err := l.Refresh(ctx)
 			cancel()
+			if err == context.DeadlineExceeded {
+				ch <- struct{}{}
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -178,8 +175,7 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 }
 
 func (l *Lock) Refresh(ctx context.Context) error {
-	res, err := l.client.Eval(ctx, luaRefresh,
-		[]string{l.key}, l.value, l.expiration.Milliseconds()).Int64()
+	res, err := l.client.Eval(ctx, luaRefresh, []string{l.key}, l.value, l.expiration.Milliseconds()).Int64()
 	if err == redis.Nil {
 		return ErrLockNotHold
 	}
@@ -193,18 +189,24 @@ func (l *Lock) Refresh(ctx context.Context) error {
 }
 
 func (l *Lock) Unlock(ctx context.Context) error {
-	res, err := l.client.Eval(ctx, luaUnlock, []string{l.key}, l.value).Int64()
 	defer func() {
 		l.unlock <- struct{}{}
+		close(l.unlock)
 	}()
+	res, err := l.client.Eval(ctx, luaUnlock, []string{l.key}, l.value).Int64()
+
 	if err == redis.Nil {
 		return ErrLockNotHold
 	}
+
 	if err != nil {
 		return err
 	}
-	if res != 1 {
+	// 要判断 res 是不是 1
+	if res == 0 {
+		// 这把锁不是你的，或者这个 key 不存在
 		return ErrLockNotHold
 	}
+
 	return nil
 }
