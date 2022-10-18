@@ -1,7 +1,13 @@
-if redis.call("get", KEYS[1]) == ARGV[1] then
+local val = redis.call('get', KEYS[1])
+-- 在加锁的重试的时候，要判断自己上一次是不是加锁成功了
+if val == false then
+    -- key 不存在
+    return redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2])
+elseif val == ARGV[1] then
     -- 刷新过期时间
-    return redis.call("pexpire", KEYS[1], ARGV[2]) == 1
+    redis.call('pexpire', KEYS[1], ARGV[2])
+    return  "OK"
 else
-    -- 设置 key value 和过期时间
-    return redis.call("set", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) == "OK"
+    -- 此时别人持有锁
+    return ""
 end

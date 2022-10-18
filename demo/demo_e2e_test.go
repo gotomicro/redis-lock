@@ -100,7 +100,7 @@ func TestClient_TryLock_e2e(t *testing.T) {
 }
 
 func (c *Client) Wait() {
-	for c.client.Ping(context.Background()) != nil {
+	for c.client.Ping(context.Background()).Err() != nil {
 
 	}
 }

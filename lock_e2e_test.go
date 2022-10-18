@@ -18,6 +18,7 @@ package rlock
 
 import (
 	"context"
+	"errors"
 	"github.com/go-redis/redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -38,7 +39,7 @@ func (s *ClientE2ESuite) SetupSuite() {
 		DB:       0,  // use default DB
 	})
 	// 确保测试的目标 Redis 已经启动成功了
-	for s.rdb.Ping(context.Background()) != nil {
+	for s.rdb.Ping(context.Background()).Err() != nil {
 
 	}
 }
@@ -50,12 +51,15 @@ func TestClientE2E(t *testing.T) {
 func (s *ClientE2ESuite) TestLock() {
 	t := s.T()
 	rdb := s.rdb
-	client := NewClient(rdb)
 	testCases := []struct {
 		name string
 
 		key        string
 		expiration time.Duration
+		retry      RetryStrategy
+		timeout    time.Duration
+
+		client *Client
 
 		wantLock *Lock
 		wantErr  error
@@ -67,7 +71,10 @@ func (s *ClientE2ESuite) TestLock() {
 			// 一次加锁成功
 			name:       "locked",
 			key:        "locked-key",
+			retry:      &FixIntervalRetry{Interval: time.Second, Max: 3},
+			timeout:    time.Second,
 			expiration: time.Minute,
+			client:     NewClient(rdb),
 			before:     func() {},
 			after: func() {
 				res, err := rdb.Del(context.Background(), "locked-key").Result()
@@ -75,81 +82,64 @@ func (s *ClientE2ESuite) TestLock() {
 				require.Equal(t, int64(1), res)
 			},
 		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.before()
-			l, err := client.TryLock(context.Background(), tc.key, tc.expiration)
-			assert.Equal(t, tc.wantErr, err)
-			if err != nil {
-				return
-			}
-			assert.Equal(t, tc.key, l.key)
-			assert.Equal(t, tc.expiration, l.expiration)
-			assert.NotEmpty(t, l.value)
-			tc.after()
-		})
-	}
-}
-
-func (s *ClientE2ESuite) TestTryLock() {
-	t := s.T()
-	rdb := s.rdb
-	client := NewClient(rdb)
-	testCases := []struct {
-		name string
-
-		key        string
-		expiration time.Duration
-
-		wantLock *Lock
-		wantErr  error
-
-		before func()
-		after  func()
-	}{
 		{
-			// 加锁成功
-			name:       "locked",
-			key:        "locked-key",
-			expiration: time.Minute,
-			before:     func() {},
-			after: func() {
-				res, err := rdb.Del(context.Background(), "locked-key").Result()
-				require.NoError(t, err)
-				require.Equal(t, int64(1), res)
-			},
-			wantLock: &Lock{
-				key:        "locked-key",
-				expiration: time.Minute,
-			},
-		},
-		{
-			// 模拟并发竞争失败
+			// 加锁不成功
 			name:       "failed",
 			key:        "failed-key",
+			retry:      &FixIntervalRetry{Interval: time.Second, Max: 3},
+			timeout:    time.Second,
 			expiration: time.Minute,
+			client:     NewClient(rdb),
 			before: func() {
-				// 假设已经有人设置了分布式锁
-				val, err := rdb.Set(context.Background(), "failed-key", "123", time.Minute).Result()
+				res, err := rdb.Set(context.Background(), "failed-key", "123", time.Minute).Result()
 				require.NoError(t, err)
-				require.Equal(t, "OK", val)
+				require.Equal(t, "OK", res)
 			},
 			after: func() {
-				res, err := rdb.Del(context.Background(), "failed-key").Result()
+				res, err := rdb.Get(context.Background(), "failed-key").Result()
 				require.NoError(t, err)
-				require.Equal(t, int64(1), res)
+				require.Equal(t, "123", res)
+				delRes, err := rdb.Del(context.Background(), "failed-key").Result()
+				require.NoError(t, err)
+				require.Equal(t, int64(1), delRes)
 			},
-			wantErr: ErrFailedToPreemptLock,
+			wantErr: context.DeadlineExceeded,
+		},
+		{
+			// 已经加锁，再加锁就是刷新超时时间
+			name:       "already-locked",
+			key:        "already-key",
+			retry:      &FixIntervalRetry{Interval: time.Second, Max: 3},
+			timeout:    time.Second,
+			expiration: time.Minute,
+			client: func() *Client {
+				client := NewClient(rdb)
+				client.valuer = func() string {
+					return "123"
+				}
+				return client
+			}(),
+			before: func() {
+				res, err := rdb.Set(context.Background(), "already-key", "123", time.Minute).Result()
+				require.NoError(t, err)
+				require.Equal(t, "OK", res)
+			},
+			after: func() {
+				res, err := rdb.Get(context.Background(), "already-key").Result()
+				require.NoError(t, err)
+				require.Equal(t, "123", res)
+				delRes, err := rdb.Del(context.Background(), "already-key").Result()
+				require.NoError(t, err)
+				require.Equal(t, int64(1), delRes)
+			},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.before()
-			l, err := client.TryLock(context.Background(), tc.key, tc.expiration)
-			assert.Equal(t, tc.wantErr, err)
+			l, err := tc.client.Lock(context.Background(), tc.key, tc.expiration, tc.retry, tc.timeout)
+			assert.True(t, errors.Is(err, tc.wantErr))
 			if err != nil {
 				return
 			}
@@ -160,6 +150,74 @@ func (s *ClientE2ESuite) TestTryLock() {
 		})
 	}
 }
+
+//func (s *ClientE2ESuite) TestTryLock() {
+//	t := s.T()
+//	rdb := s.rdb
+//	client := NewClient(rdb)
+//	testCases := []struct {
+//		name string
+//
+//		key        string
+//		expiration time.Duration
+//
+//		wantLock *Lock
+//		wantErr  error
+//
+//		before func()
+//		after  func()
+//	}{
+//		{
+//			// 加锁成功
+//			name:       "locked",
+//			key:        "locked-key",
+//			expiration: time.Minute,
+//			before:     func() {},
+//			after: func() {
+//				res, err := rdb.Del(context.Background(), "locked-key").Result()
+//				require.NoError(t, err)
+//				require.Equal(t, int64(1), res)
+//			},
+//			wantLock: &Lock{
+//				key:        "locked-key",
+//				expiration: time.Minute,
+//			},
+//		},
+//		{
+//			// 模拟并发竞争失败
+//			name:       "failed",
+//			key:        "failed-key",
+//			expiration: time.Minute,
+//			before: func() {
+//				// 假设已经有人设置了分布式锁
+//				val, err := rdb.Set(context.Background(), "failed-key", "123", time.Minute).Result()
+//				require.NoError(t, err)
+//				require.Equal(t, "OK", val)
+//			},
+//			after: func() {
+//				res, err := rdb.Del(context.Background(), "failed-key").Result()
+//				require.NoError(t, err)
+//				require.Equal(t, int64(1), res)
+//			},
+//			wantErr: ErrFailedToPreemptLock,
+//		},
+//	}
+//
+//	for _, tc := range testCases {
+//		t.Run(tc.name, func(t *testing.T) {
+//			tc.before()
+//			l, err := client.TryLock(context.Background(), tc.key, tc.expiration)
+//			assert.Equal(t, tc.wantErr, err)
+//			if err != nil {
+//				return
+//			}
+//			assert.Equal(t, tc.key, l.key)
+//			assert.Equal(t, tc.expiration, l.expiration)
+//			assert.NotEmpty(t, l.value)
+//			tc.after()
+//		})
+//	}
+//}
 
 func (s *ClientE2ESuite) TestUnLock(t *testing.T) {
 	rdb := s.rdb
