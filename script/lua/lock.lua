@@ -5,7 +5,7 @@ if val == false then
     return redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[2])
 elseif val == ARGV[1] then
     -- 刷新过期时间
-    redis.call('pexpire', KEYS[1], ARGV[2])
+    redis.call('expire', KEYS[1], ARGV[2])
     return  "OK"
 else
     -- 此时别人持有锁

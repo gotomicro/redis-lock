@@ -17,6 +17,7 @@ package rlock
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/go-redis/redis/v9"
 	"github.com/golang/mock/gomock"
 	"github.com/gotomicro/redis-lock/mocks"
@@ -25,6 +26,153 @@ import (
 	"testing"
 	"time"
 )
+
+func TestClient_Lock(t *testing.T) {
+	t.Parallel()
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	testCases := []struct {
+		name string
+
+		mock func() redis.Cmdable
+
+		key        string
+		expiration time.Duration
+		retry      RetryStrategy
+		timeout    time.Duration
+
+		wantLock *Lock
+		wantErr  string
+	}{
+		{
+			name: "locked",
+			mock: func() redis.Cmdable {
+				cmdable := mocks.NewMockCmdable(ctrl)
+				res := redis.NewCmd(nil, nil)
+				res.SetVal("OK")
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"locked-key"}, gomock.Any()).
+					Return(res)
+				return cmdable
+			},
+			key:        "locked-key",
+			expiration: time.Minute,
+			retry:      &FixIntervalRetry{Interval: time.Second, Max: 1},
+			timeout:    time.Second,
+			wantLock: &Lock{
+				key:        "locked-key",
+				expiration: time.Minute,
+			},
+		},
+		{
+			name: "not retryable",
+			mock: func() redis.Cmdable {
+				cmdable := mocks.NewMockCmdable(ctrl)
+				res := redis.NewCmd(nil, nil)
+				res.SetErr(errors.New("network error"))
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"locked-key"}, gomock.Any()).
+					Return(res)
+				return cmdable
+			},
+			key:        "locked-key",
+			expiration: time.Minute,
+			retry:      &FixIntervalRetry{Interval: time.Second, Max: 1},
+			timeout:    time.Second,
+			wantErr:    "network error",
+		},
+		{
+			name: "retry over times",
+			mock: func() redis.Cmdable {
+				cmdable := mocks.NewMockCmdable(ctrl)
+				first := redis.NewCmd(nil, nil)
+				first.SetErr(context.DeadlineExceeded)
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"retry-key"}, gomock.Any()).
+					Times(3).Return(first)
+				return cmdable
+			},
+			key:        "retry-key",
+			expiration: time.Minute,
+			retry:      &FixIntervalRetry{Interval: time.Millisecond, Max: 2},
+			timeout:    time.Second,
+			wantErr:    "rlock: 重试机会耗尽，最后一次重试错误: context deadline exceeded",
+		},
+		{
+			name: "retry over times-lock holded",
+			mock: func() redis.Cmdable {
+				cmdable := mocks.NewMockCmdable(ctrl)
+				first := redis.NewCmd(nil, nil)
+				//first.Set
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"retry-key"}, gomock.Any()).
+					Times(3).Return(first)
+				return cmdable
+			},
+			key:        "retry-key",
+			expiration: time.Minute,
+			retry:      &FixIntervalRetry{Interval: time.Millisecond, Max: 2},
+			timeout:    time.Second,
+			wantErr:    "rlock: 重试机会耗尽，锁被人持有: rlock: 抢锁失败",
+		},
+		{
+			name: "retry and success",
+			mock: func() redis.Cmdable {
+				cmdable := mocks.NewMockCmdable(ctrl)
+				first := redis.NewCmd(nil, nil)
+				first.SetVal("")
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"retry-key"}, gomock.Any()).
+					Times(2).Return(first)
+				second := redis.NewCmd(nil, nil)
+				second.SetVal("OK")
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"retry-key"}, gomock.Any()).
+					Return(second)
+				return cmdable
+			},
+			key:        "retry-key",
+			expiration: time.Minute,
+			retry:      &FixIntervalRetry{Interval: time.Millisecond, Max: 3},
+			timeout:    time.Second,
+			wantLock: &Lock{
+				key:        "retry-key",
+				expiration: time.Minute,
+			},
+		},
+		{
+			name: "retry but timeout",
+			mock: func() redis.Cmdable {
+				cmdable := mocks.NewMockCmdable(ctrl)
+				first := redis.NewCmd(nil, nil)
+				first.SetVal("")
+				cmdable.EXPECT().Eval(gomock.Any(), luaLock, []string{"retry-key"}, gomock.Any()).
+					Times(2).Return(first)
+				return cmdable
+			},
+			key:        "retry-key",
+			expiration: time.Minute,
+			retry:      &FixIntervalRetry{Interval: time.Millisecond * 550, Max: 2},
+			timeout:    time.Second,
+			wantErr:    "context deadline exceeded",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockRedisCmd := tc.mock()
+			client := NewClient(mockRedisCmd)
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			defer cancel()
+			l, err := client.Lock(ctx, tc.key, tc.expiration, tc.retry, time.Second)
+			if tc.wantErr != "" {
+				assert.EqualError(t, err, tc.wantErr)
+				return
+			} else {
+				require.NoError(t, err)
+			}
+
+			assert.Equal(t, mockRedisCmd, l.client)
+			assert.Equal(t, tc.key, l.key)
+			assert.Equal(t, tc.expiration, l.expiration)
+			assert.NotEmpty(t, l.value)
+		})
+	}
+}
 
 func TestClient_TryLock(t *testing.T) {
 	ctrl := gomock.NewController(t)
@@ -162,10 +310,10 @@ func TestLock_Unlock(t *testing.T) {
 
 func ExampleLock_Refresh() {
 	var lock *Lock
+	end := make(chan struct{}, 1)
 	go func() {
 		ticker := time.NewTicker(time.Second * 30)
 		for {
-
 			select {
 			case <-ticker.C:
 				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -181,14 +329,35 @@ func ExampleLock_Refresh() {
 					// 其它错误，你要考虑这个错误能不能继续处理
 					// 如果不能处理，你怎么通知后续业务中断？
 				}
+			case <-end:
+				// 你的业务退出了
 			}
 		}
 	}()
 	// 后面是你的业务
+	fmt.Println("Finish")
+	// 你的业务完成了
+	end <- struct{}{}
+	// Output:
+	// Finish
 }
 
-func ExampleLock_AutoRefresh() {
-	var lock *Lock
-	go lock.AutoRefresh(time.Second*30, time.Second)
-	// 你的业务
+func TestClient_SingleflightLock(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	rdb := mocks.NewMockCmdable(ctrl)
+	cmd := redis.NewCmd(context.Background())
+	cmd.SetVal("OK")
+	rdb.EXPECT().Eval(gomock.Any(), luaLock, gomock.Any(), gomock.Any()).
+		Return(cmd)
+	client := NewClient(rdb)
+	// TODO 并发测试
+	_, err := client.SingleflightLock(context.Background(),
+		"key1",
+		time.Minute,
+		&FixIntervalRetry{
+			Interval: time.Millisecond,
+			Max:      3,
+		}, time.Second)
+	require.NoError(t, err)
 }

@@ -80,7 +80,7 @@ func (c *Client) SingleflightLock(ctx context.Context, key string, expiration ti
 }
 
 // Lock 是尽可能重试减少加锁失败的可能
-// Lock 只会在超时错误的情况下进行重试
+// Lock 会在超时或者锁正被人持有的时候进行重试
 // 最后返回的 error 使用 errors.Is 判断，可能是：
 // - context.DeadlineExceeded: Lock 整体调用超时
 // - ErrFailedToPreemptLock: 超过重试次数，但是整个重试过程都没有出现错误
@@ -99,7 +99,7 @@ func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration,
 	}()
 	for {
 		lctx, cancel := context.WithTimeout(ctx, timeout)
-		res, err := c.client.Eval(lctx, luaLock, []string{key}, val, expiration.Milliseconds()).Result()
+		res, err := c.client.Eval(lctx, luaLock, []string{key}, val, expiration.Seconds()).Result()
 		cancel()
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			// 非超时错误，那么基本上代表遇到了一些不可挽回的场景，所以没太大必要继续尝试了
@@ -114,7 +114,7 @@ func (c *Client) Lock(ctx context.Context, key string, expiration time.Duration,
 			if err != nil {
 				err = fmt.Errorf("最后一次重试错误: %w", err)
 			} else {
-				err = ErrFailedToPreemptLock
+				err = fmt.Errorf("锁被人持有: %w", ErrFailedToPreemptLock)
 			}
 			return nil, fmt.Errorf("rlock: 重试机会耗尽，%w", err)
 		}
@@ -174,22 +174,24 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			err := l.Refresh(ctx)
+			cancel()
 			// 超时这里，可以继续尝试
 			for err == context.DeadlineExceeded {
 				ch <- struct{}{}
+				continue
 			}
-			cancel()
 			if err != nil {
 				return err
 			}
 		case <-ch:
 			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			err := l.Refresh(ctx)
+			cancel()
 			// 超时这里，可以继续尝试
 			if err == context.DeadlineExceeded {
 				ch <- struct{}{}
+				continue
 			}
-			cancel()
 			if err != nil {
 				return err
 			}
@@ -201,7 +203,7 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 
 func (l *Lock) Refresh(ctx context.Context) error {
 	res, err := l.client.Eval(ctx, luaRefresh,
-		[]string{l.key}, l.value, l.expiration.Milliseconds()).Int64()
+		[]string{l.key}, l.value, l.expiration.Seconds()).Int64()
 	if err == redis.Nil {
 		return ErrLockNotHold
 	}
