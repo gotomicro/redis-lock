@@ -19,10 +19,12 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
+
 	"github.com/go-redis/redis/v9"
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
-	"time"
 )
 
 var (
@@ -147,11 +149,12 @@ func (c *Client) TryLock(ctx context.Context,
 }
 
 type Lock struct {
-	client     redis.Cmdable
-	key        string
-	value      string
-	expiration time.Duration
-	unlock     chan struct{}
+	client           redis.Cmdable
+	key              string
+	value            string
+	expiration       time.Duration
+	unlock           chan struct{}
+	signalUnlockOnce sync.Once
 }
 
 func newLock(client redis.Cmdable, key string, value string, expiration time.Duration) *Lock {
@@ -168,7 +171,10 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 	ticker := time.NewTicker(interval)
 	// 刷新超时 channel
 	ch := make(chan struct{}, 1)
-	defer close(ch)
+	defer func() {
+		ticker.Stop()
+		close(ch)
+	}()
 	for {
 		select {
 		case <-ticker.C:
@@ -176,8 +182,14 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 			err := l.Refresh(ctx)
 			cancel()
 			// 超时这里，可以继续尝试
-			for err == context.DeadlineExceeded {
-				ch <- struct{}{}
+			if err == context.DeadlineExceeded {
+				// 因为有两个可能的地方要写入数据，而 ch
+				// 容量只有一个，所以如果写不进去就说明前一次调用超时了，并且还没被处理，
+				// 与此同时计时器也触发了
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
 				continue
 			}
 			if err != nil {
@@ -189,7 +201,10 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 			cancel()
 			// 超时这里，可以继续尝试
 			if err == context.DeadlineExceeded {
-				ch <- struct{}{}
+				select {
+				case ch <- struct{}{}:
+				default:
+				}
 				continue
 			}
 			if err != nil {
@@ -204,9 +219,6 @@ func (l *Lock) AutoRefresh(interval time.Duration, timeout time.Duration) error 
 func (l *Lock) Refresh(ctx context.Context) error {
 	res, err := l.client.Eval(ctx, luaRefresh,
 		[]string{l.key}, l.value, l.expiration.Seconds()).Int64()
-	if err == redis.Nil {
-		return ErrLockNotHold
-	}
 	if err != nil {
 		return err
 	}
@@ -216,10 +228,15 @@ func (l *Lock) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// Unlock 解锁
 func (l *Lock) Unlock(ctx context.Context) error {
 	res, err := l.client.Eval(ctx, luaUnlock, []string{l.key}, l.value).Int64()
 	defer func() {
-		l.unlock <- struct{}{}
+		// 避免重复解锁引起 panic
+		l.signalUnlockOnce.Do(func() {
+			l.unlock <- struct{}{}
+			close(l.unlock)
+		})
 	}()
 	if err == redis.Nil {
 		return ErrLockNotHold
