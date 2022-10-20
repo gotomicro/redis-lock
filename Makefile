@@ -39,3 +39,7 @@ e2e_up:
 .PHONY: e2e_down
 e2e_down:
 	docker compose -f script/docker-compose.yml down
+
+.PHONY: mock
+mock:
+	mockgen -copyright_file=.license.go.header -package=mocks -destination=mocks/redis_cmdable.mock.go github.com/go-redis/redis/v9 Cmdable
