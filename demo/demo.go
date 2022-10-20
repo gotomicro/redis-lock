@@ -20,11 +20,12 @@ import (
 	"context"
 	_ "embed"
 	"errors"
+	"time"
+
 	"github.com/go-redis/redis/v9"
 	"github.com/google/uuid"
-	"github.com/gotomicro/redis-lock"
+	rlock "github.com/gotomicro/redis-lock"
 	"golang.org/x/sync/singleflight"
-	"time"
 )
 
 var (

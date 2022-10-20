@@ -19,12 +19,13 @@ package rlock
 import (
 	"context"
 	"errors"
+	"testing"
+	"time"
+
 	"github.com/go-redis/redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"testing"
-	"time"
 )
 
 type ClientE2ESuite struct {
@@ -151,75 +152,177 @@ func (s *ClientE2ESuite) TestLock() {
 	}
 }
 
-//func (s *ClientE2ESuite) TestTryLock() {
-//	t := s.T()
-//	rdb := s.rdb
-//	client := NewClient(rdb)
-//	testCases := []struct {
-//		name string
-//
-//		key        string
-//		expiration time.Duration
-//
-//		wantLock *Lock
-//		wantErr  error
-//
-//		before func()
-//		after  func()
-//	}{
-//		{
-//			// 加锁成功
-//			name:       "locked",
-//			key:        "locked-key",
-//			expiration: time.Minute,
-//			before:     func() {},
-//			after: func() {
-//				res, err := rdb.Del(context.Background(), "locked-key").Result()
-//				require.NoError(t, err)
-//				require.Equal(t, int64(1), res)
-//			},
-//			wantLock: &Lock{
-//				key:        "locked-key",
-//				expiration: time.Minute,
-//			},
-//		},
-//		{
-//			// 模拟并发竞争失败
-//			name:       "failed",
-//			key:        "failed-key",
-//			expiration: time.Minute,
-//			before: func() {
-//				// 假设已经有人设置了分布式锁
-//				val, err := rdb.Set(context.Background(), "failed-key", "123", time.Minute).Result()
-//				require.NoError(t, err)
-//				require.Equal(t, "OK", val)
-//			},
-//			after: func() {
-//				res, err := rdb.Del(context.Background(), "failed-key").Result()
-//				require.NoError(t, err)
-//				require.Equal(t, int64(1), res)
-//			},
-//			wantErr: ErrFailedToPreemptLock,
-//		},
-//	}
-//
-//	for _, tc := range testCases {
-//		t.Run(tc.name, func(t *testing.T) {
-//			tc.before()
-//			l, err := client.TryLock(context.Background(), tc.key, tc.expiration)
-//			assert.Equal(t, tc.wantErr, err)
-//			if err != nil {
-//				return
-//			}
-//			assert.Equal(t, tc.key, l.key)
-//			assert.Equal(t, tc.expiration, l.expiration)
-//			assert.NotEmpty(t, l.value)
-//			tc.after()
-//		})
-//	}
-//}
+func (s *ClientE2ESuite) TestTryLock() {
+	t := s.T()
+	rdb := s.rdb
+	client := NewClient(rdb)
+	testCases := []struct {
+		name string
 
-func (s *ClientE2ESuite) TestUnLock(t *testing.T) {
+		key        string
+		expiration time.Duration
+
+		wantLock *Lock
+		wantErr  error
+
+		before func()
+		after  func()
+	}{
+		{
+			// 加锁成功
+			name:       "locked",
+			key:        "locked-key",
+			expiration: time.Minute,
+			before:     func() {},
+			after: func() {
+				res, err := rdb.Del(context.Background(), "locked-key").Result()
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res)
+			},
+			wantLock: &Lock{
+				key:        "locked-key",
+				expiration: time.Minute,
+			},
+		},
+		{
+			// 模拟并发竞争失败
+			name:       "failed",
+			key:        "failed-key",
+			expiration: time.Minute,
+			before: func() {
+				// 假设已经有人设置了分布式锁
+				val, err := rdb.Set(context.Background(), "failed-key", "123", time.Minute).Result()
+				require.NoError(t, err)
+				require.Equal(t, "OK", val)
+			},
+			after: func() {
+				res, err := rdb.Del(context.Background(), "failed-key").Result()
+				require.NoError(t, err)
+				require.Equal(t, int64(1), res)
+			},
+			wantErr: ErrFailedToPreemptLock,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.before()
+			l, err := client.TryLock(context.Background(), tc.key, tc.expiration)
+			assert.Equal(t, tc.wantErr, err)
+			if err != nil {
+				return
+			}
+			assert.Equal(t, tc.key, l.key)
+			assert.Equal(t, tc.expiration, l.expiration)
+			assert.NotEmpty(t, l.value)
+			tc.after()
+		})
+	}
+}
+
+func (s *ClientE2ESuite) TestRefresh() {
+	t := s.T()
+	rdb := s.rdb
+	testCases := []struct {
+		name string
+
+		timeout time.Duration
+		lock    *Lock
+
+		wantErr error
+
+		before func()
+		after  func()
+	}{
+		{
+			name: "refresh success",
+			lock: &Lock{
+				key:        "refresh-key",
+				value:      "123",
+				expiration: time.Minute,
+				unlock:     make(chan struct{}, 1),
+				client:     rdb,
+			},
+			before: func() {
+				// 设置一个比较短的过期时间
+				res, err := rdb.SetNX(context.Background(),
+					"refresh-key", "123", time.Second*10).Result()
+				require.NoError(t, err)
+				assert.True(t, res)
+			},
+			after: func() {
+				res, err := rdb.TTL(context.Background(), "refresh-key").Result()
+				require.NoError(t, err)
+				// 刷新完过期时间
+				assert.True(t, res.Seconds() > 50)
+				// 清理数据
+				rdb.Del(context.Background(), "refresh-key")
+			},
+			timeout: time.Minute,
+		},
+		{
+			// 锁被人持有
+			name: "refresh failed",
+			lock: &Lock{
+				key:        "refresh-key",
+				value:      "123",
+				expiration: time.Minute,
+				unlock:     make(chan struct{}, 1),
+				client:     rdb,
+			},
+			before: func() {
+				// 设置一个比较短的过期时间
+				res, err := rdb.SetNX(context.Background(),
+					"refresh-key", "456", time.Second*10).Result()
+				require.NoError(t, err)
+				assert.True(t, res)
+			},
+			after: func() {
+				res, err := rdb.Get(context.Background(), "refresh-key").Result()
+				require.NoError(t, err)
+				require.Equal(t, "456", res)
+				rdb.Del(context.Background(), "refresh-key")
+			},
+			timeout: time.Minute,
+			wantErr: ErrLockNotHold,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.before()
+			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
+			err := tc.lock.Refresh(ctx)
+			cancel()
+			assert.Equal(t, tc.wantErr, err)
+			tc.after()
+		})
+	}
+}
+
+func (s *ClientE2ESuite) TestAutoRefresh() {
+	t := s.T()
+	rdb := s.rdb
+	client := NewClient(rdb)
+	l, err := client.TryLock(context.Background(), "auto-refresh-key", time.Second)
+	require.NoError(t, err)
+	go func() {
+		err = l.AutoRefresh(time.Millisecond*800, time.Millisecond*300)
+		require.NoError(t, err)
+	}()
+	// 模拟业务
+	time.Sleep(time.Second * 2)
+	// 因为自动刷新了，所以 key 还在
+	res, err := rdb.Exists(context.Background(), "auto-refresh-key").Result()
+	require.NoError(t, err)
+	require.Equal(t, int64(1), res)
+
+	err = l.Unlock(context.Background())
+	require.NoError(t, err)
+}
+
+func (s *ClientE2ESuite) TestUnLock() {
+	t := s.T()
 	rdb := s.rdb
 	client := NewClient(rdb)
 	testCases := []struct {

@@ -18,11 +18,12 @@ package demo
 
 import (
 	"context"
+	"testing"
+	"time"
+
 	"github.com/go-redis/redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
-	"time"
 )
 
 func TestClient_TryLock_e2e(t *testing.T) {

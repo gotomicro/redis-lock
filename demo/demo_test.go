@@ -19,12 +19,13 @@ package demo
 import (
 	"context"
 	"errors"
+	"testing"
+	"time"
+
 	"github.com/go-redis/redis/v9"
 	"github.com/golang/mock/gomock"
 	"github.com/gotomicro/redis-lock/mocks"
 	"github.com/stretchr/testify/assert"
-	"testing"
-	"time"
 )
 
 func TestClient_TryLock(t *testing.T) {
