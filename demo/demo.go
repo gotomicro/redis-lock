@@ -22,9 +22,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/go-redis/redis/v9"
-	"github.com/google/uuid"
 	rlock "github.com/gotomicro/redis-lock"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
 

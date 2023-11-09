@@ -19,10 +19,10 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"github.com/redis/go-redis/v9"
 	"sync"
 	"time"
 
-	"github.com/go-redis/redis/v9"
 	"github.com/google/uuid"
 	"golang.org/x/sync/singleflight"
 )

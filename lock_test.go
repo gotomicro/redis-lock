@@ -18,12 +18,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"go.uber.org/mock/gomock"
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v9"
-	"github.com/golang/mock/gomock"
 	"github.com/gotomicro/redis-lock/mocks"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -22,9 +22,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-redis/redis/v9"
-	"github.com/golang/mock/gomock"
 	"github.com/gotomicro/redis-lock/mocks"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 )
 
